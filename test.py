@@ -6,18 +6,19 @@ import numpy as np
 from collections import deque
 
 mp_pose = mp.solutions.pose
-WINDOW_SIZE = 3     # SMA 的 W
+SMA_WINDOW = 3          # 用於濾波
+ENV_WINDOW = 3          # 用於 E(t)，讓大小變化平滑一點
 
 # 全域共享
 latest_frame = None        # 最新原始畫面（彩色）
 processed_frame = None     # 已畫好 Pose 的畫面（灰階或灰階+骨架）
-latest_frame_id = -1       # 目前 latest_frame 是第幾幀
+latest_frame_id = -1       # 目前最新畫面是第幾幀
 lock = threading.Lock()
 running = True
 
 VIDEO_PATH = "test_video1.MP4"
 TARGET_FPS = 10.0          # 播放 & 取樣幀率
-SAMPLE_FPS = TARGET_FPS    # 真正給頻率分析用的採樣率（由主 thread 控 FPS）
+SAMPLE_FPS = TARGET_FPS    # 真正給頻率分析用的採樣率（由 processing loop 動態估）
 
 # -------- 只用 1~12 + 23,24 --------
 VISIBLE_POINTS = list(range(1, 13)) + [23, 24]
@@ -145,7 +146,6 @@ def capture_loop():
     cap.release()
 
 
-
 def processing_loop():
     global latest_frame, processed_frame, running, latest_frame_id, SAMPLE_FPS
 
@@ -159,12 +159,7 @@ def processing_loop():
     SMALL_W = 480
     SMALL_H = 270
 
-    # ====== 狀態變數 ======
-    prev_center = None                      # P_curr(t-1)
-    window_P = deque(maxlen=WINDOW_SIZE)    # Step3: SMA 視窗 (存 P_curr)
-    window_M = deque(maxlen=WINDOW_SIZE)    # Step4: Envelope 視窗 (存 |V|)
-    envelope = 0.0                          # E(t)
-
+    # ====== 共用狀態變數 ======
     last_sample_time = None
     ema_dt = None
     last_processed_id = -1
@@ -173,8 +168,57 @@ def processing_loop():
     cut_thresh = 0.1 * min(SMALL_W, SMALL_H)
 
     target_radius   = 30.0   # 圓盤半徑 & 動態增益目標振幅
-    compass_margin  = 20     # 右下小圈離邊界距離
+    debug_margin    = 10
+    row_spacing     = 2 * target_radius + 20
+
     SAMPLE_FPS      = TARGET_FPS
+
+    # ====== Mediapipe / Optical-flow 後端狀態 ======
+    # MediaPipe
+    prev_P_MP   = None
+    window_P_MP = deque(maxlen=SMA_WINDOW)
+    window_M_MP = deque(maxlen=ENV_WINDOW)
+    envelope_MP = 0.0
+    axis_MP_last = None
+
+    # Optical Flow
+    prev_gray   = None
+    prev_pts    = None
+    P_virtual   = None
+    prev_P_OF   = None
+    window_P_OF = deque(maxlen=SMA_WINDOW)
+    window_M_OF = deque(maxlen=ENV_WINDOW)
+    envelope_OF = 0.0
+    axis_OF_last = None
+
+    # goodFeaturesToTrack 參數
+    FLOW_MAX_CORNERS = 80
+    FLOW_QUALITY     = 0.01
+    FLOW_MIN_DIST    = 7
+
+    eps = 1e-4
+
+    def draw_axis_arrow(img, center, axis, radius, color, thickness=2):
+        if axis is None:
+            return
+        axis = np.asarray(axis, dtype=np.float32)
+        norm = float(np.linalg.norm(axis))
+        if norm < eps:
+            return
+        u = axis / norm
+        base = center - u * radius
+        tip  = center + u * radius
+        base_pt = (int(base[0]), int(base[1]))
+        tip_pt  = (int(tip[0]),  int(tip[1]))
+        cv2.arrowedLine(
+            img,
+            base_pt,
+            tip_pt,
+            color,
+            thickness,
+            cv2.LINE_AA,
+            tipLength=0.2,
+        )
 
     while running:
         frame_copy = None
@@ -199,30 +243,49 @@ def processing_loop():
         gray_bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
         gray_rgb = cv2.cvtColor(gray_bgr, cv2.COLOR_BGR2RGB)
 
+        # MediaPipe Pose
         result = pose.process(gray_rgb)
 
         h, w, _ = gray_bgr.shape
 
-        # 中間大圈圓心（最終 output + 箭頭）
+        # 中間大圈圓心（最終 output）
         center_center = np.array([w / 2.0, h / 2.0], dtype=np.float32)
 
-        # 右下小圈圓心（原始未投影 output）
-        compass_center = np.array(
-            [w - compass_margin - target_radius,
-             h - compass_margin - target_radius],
-            dtype=np.float32
+        # 右上/右下 四顆 debug 球的中心
+        mp_row_y = debug_margin + target_radius
+        of_row_y = mp_row_y + row_spacing
+
+        mp_proj_center = np.array(
+            [w - debug_margin - 3 * target_radius, mp_row_y],
+            dtype=np.float32,
+        )
+        mp_raw_center = np.array(
+            [w - debug_margin - 1 * target_radius, mp_row_y],
+            dtype=np.float32,
+        )
+        of_proj_center = np.array(
+            [w - debug_margin - 3 * target_radius, of_row_y],
+            dtype=np.float32,
+        )
+        of_raw_center = np.array(
+            [w - debug_margin - 1 * target_radius, of_row_y],
+            dtype=np.float32,
         )
 
-        fusion_center = None   # P_curr(t)
-        face_point    = None   # 臉（鼻子）
-        pelvis_center = None   # 骨盆中點
 
-        # ====== Step 1: 訊號融合 + 頭 / 骨盆 ======
+        # ====== MediaPipe 取得質心 & 軸向 & Guard 資訊 ======
+        fusion_center_mp = None   # Raw_Point_MP
+        axis_MP = None
+        face_point = None
+        pelvis_center = None
+        avg_visibility = 0.0
+        body_size_norm = 0.0
+
         if result.pose_landmarks:
             lms = result.pose_landmarks.landmark
             draw_selected_landmarks(gray_bgr, result.pose_landmarks)
 
-            # 14 點平均 = P_curr
+            # 14 點平均 = fusion_center_mp
             xs, ys = [], []
             for idx in VISIBLE_POINTS:
                 lm = lms[idx]
@@ -234,7 +297,7 @@ def processing_loop():
             if xs and ys:
                 cx = float(np.mean(xs))
                 cy = float(np.mean(ys))
-                fusion_center = np.array([cx, cy], dtype=np.float32)
+                fusion_center_mp = np.array([cx, cy], dtype=np.float32)
 
             # 臉：鼻子 (0)
             nose_lm = lms[0]
@@ -243,7 +306,7 @@ def processing_loop():
             if 0 <= nx < SMALL_W and 0 <= ny < SMALL_H:
                 face_point = np.array([nx, ny], dtype=np.float32)
 
-            # 骨盆：左右臀 (23,24) 平均
+            # 骨盆：左右肩 (11,12) 平均（當作上半身中心）
             lh_lm = lms[11]
             rh_lm = lms[12]
             lx, ly = lh_lm.x * SMALL_W, lh_lm.y * SMALL_H
@@ -254,137 +317,292 @@ def processing_loop():
                                           (ly + ry) / 2.0],
                                          dtype=np.float32)
 
-        # 動態輸出向量（2D）
-        scaled_V = np.array([0.0, 0.0], dtype=np.float32)
+            # Guard 用：visibility 平均 & 骨架大小
+            vis_list = [lm.visibility for lm in lms]
+            avg_visibility = float(np.mean(vis_list))
 
-        # arrow 用的單位方向向量（骨盆→頭）
-        dir_u = None
+            xs_n = [lm.x for lm in lms]
+            ys_n = [lm.y for lm in lms]
+            box_w = max(xs_n) - min(xs_n)
+            box_h = max(ys_n) - min(ys_n)
+            body_size_norm = (box_w ** 2 + box_h ** 2) ** 0.5  # 對角線長，0~sqrt(2)
 
-        # ====== Step 2~5：有人體才做 ======
-        if fusion_center is not None:
-            now = time.time()
-
-            # FPS 估計
-            if last_sample_time is not None:
-                dt = now - last_sample_time
-                if dt > 1e-4:
-                    if ema_dt is None:
-                        ema_dt = dt
-                    else:
-                        ema_dt = 0.9 * ema_dt + 0.1 * dt
-            last_sample_time = now
-
-            if ema_dt is not None and ema_dt > 1e-4:
-                SAMPLE_FPS = 1.0 / ema_dt
-            else:
-                SAMPLE_FPS = TARGET_FPS
-
-            # Step 2：Cut detection
-            if prev_center is not None:
-                dist = float(np.linalg.norm(fusion_center - prev_center))
-                if dist > cut_thresh:
-                    window_P.clear()
-                    window_M.clear()
-                    envelope = 0.0
-            prev_center = fusion_center.copy()
-
-            # Step 3：SMA baseline
-            window_P.append(fusion_center.copy())
-            if len(window_P) > 0:
-                baseline = np.mean(window_P, axis=0)
-            else:
-                baseline = fusion_center.copy()
-
-            V = fusion_center - baseline
-
-            # Step 4：Envelope（sliding window max）
-            M_inst = float(np.linalg.norm(V))
-            window_M.append(M_inst)
-            envelope = max(window_M) if len(window_M) > 0 else 0.0
-
-            # Step 5：Dynamic gain
-            if envelope < 1e-4:
-                scaled_V = np.array([0.0, 0.0], dtype=np.float32)
-            else:
-                gain = target_radius / envelope
-                scaled_V = V * gain
-
-            # 骨盆→頭方向 dir_u
+            # 當前 Body Axis
             if face_point is not None and pelvis_center is not None:
-                dir_vec  = face_point - pelvis_center
+                dir_vec = face_point - pelvis_center
                 norm_dir = float(np.linalg.norm(dir_vec))
-                if norm_dir > 1e-4:
-                    dir_u = dir_vec / norm_dir
+                if norm_dir > eps:
+                    axis_MP = dir_vec / norm_dir
+                    axis_MP_last = axis_MP.copy()
 
-        # ====== 中間大圈：最終 output（有投影 & 箭頭） ======
+        # Guard：決定最終輸出使用哪一路
+        use_mediapipe = False
+        GUARD_VIS_THRESH  = 0.7
+        GUARD_SIZE_THRESH = 0.45   # 身體至少佔畫面 ~45% 對角線，避免抓到小人偶
 
-        # 先用 scaled_V 當原始振動
-        final_V = scaled_V.copy()
+        if fusion_center_mp is not None:
+            cond_pose = True
+            cond_vis  = (avg_visibility > GUARD_VIS_THRESH)
+            cond_size = (body_size_norm > GUARD_SIZE_THRESH)
+            use_mediapipe = cond_pose and cond_vis and cond_size
 
-        # 有朝向就做投影：final_V = scaled_V 在 dir_u 上的分量
-        if fusion_center is not None and dir_u is not None:
-            t = float(np.dot(scaled_V, dir_u))   # 標量投影
-            final_V = dir_u * t
+        # ====== Optical Flow：計算 v_flow & 更新 P_virtual ======
+        if prev_gray is None:
+            prev_gray = gray.copy()
+            prev_pts = cv2.goodFeaturesToTrack(
+                prev_gray,
+                maxCorners=FLOW_MAX_CORNERS,
+                qualityLevel=FLOW_QUALITY,
+                minDistance=FLOW_MIN_DIST,
+                blockSize=7,
+            )
 
-        center_output = center_center + final_V
+        v_flow = np.zeros(2, dtype=np.float32)
 
-        # 限制在大圈內
+        if prev_gray is not None and prev_pts is not None and len(prev_pts) > 0:
+            next_pts, status, err = cv2.calcOpticalFlowPyrLK(
+                prev_gray,
+                gray,
+                prev_pts,
+                None,
+                winSize=(21, 21),
+                maxLevel=3,
+                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+            )
+
+            if next_pts is not None and status is not None:
+                good_new = next_pts[status.reshape(-1) == 1]
+                good_old = prev_pts[status.reshape(-1) == 1]
+
+                if len(good_new) > 0:
+                    diffs = good_new - good_old
+                    mean_diff = np.mean(diffs, axis=0)
+                    v_flow = mean_diff.astype(np.float32)
+
+        # ---- 更新 P_virtual（光流虛擬質心） ----
+        if P_virtual is None:
+            # 第一次就從畫面中心開始
+            P_virtual = center_center.copy()
+        else:
+            # 確保是 1D numpy 向量
+            P_virtual = np.asarray(P_virtual, dtype=np.float32).reshape(-1)
+            # 如果形狀怪怪的就重設
+            if P_virtual.shape[0] != 2:
+                P_virtual = center_center.copy()
+
+        # v_flow 也確保成 2D 向量
+        v_flow = np.asarray(v_flow, dtype=np.float32).reshape(-1)
+        if v_flow.shape[0] != 2:
+            v_flow = np.zeros(2, dtype=np.float32)
+
+        # 累加成虛擬位置
+        P_virtual = P_virtual + v_flow
+
+        # clamp 在畫面內（不用再包 float，直接賦值就好）
+        P_virtual[0] = np.clip(P_virtual[0], 0.0, SMALL_W  - 1.0)
+        P_virtual[1] = np.clip(P_virtual[1], 0.0, SMALL_H - 1.0)
+
+
+
+        # ====== FPS 估計（以 processing loop 節奏為主） ======
+        now = time.time()
+        if last_sample_time is not None:
+            dt = now - last_sample_time
+            if dt > eps:
+                if ema_dt is None:
+                    ema_dt = dt
+                else:
+                    ema_dt = 0.9 * ema_dt + 0.1 * dt
+        last_sample_time = now
+
+        if ema_dt is not None and ema_dt > eps:
+            SAMPLE_FPS = 1.0 / ema_dt
+        else:
+            SAMPLE_FPS = TARGET_FPS
+
+        # ====== 後端共用：SMA → Project → WindowMax → Gain ======
+
+        # 初始化五顆球的 offset & 軸
+        offset_MP_proj = np.zeros(2, dtype=np.float32)
+        offset_MP_raw  = np.zeros(2, dtype=np.float32)
+        offset_OF_proj = np.zeros(2, dtype=np.float32)
+        offset_OF_raw  = np.zeros(2, dtype=np.float32)
+        axis_MP_used   = None
+        axis_OF_used   = None
+
+        # ---------- MediaPipe 路徑 ----------
+        if fusion_center_mp is not None:
+            P_mp = fusion_center_mp
+
+            # Cut detection
+            if prev_P_MP is not None:
+                dist = float(np.linalg.norm(P_mp - prev_P_MP))
+                if dist > cut_thresh:
+                    window_P_MP.clear()
+                    window_M_MP.clear()
+                    envelope_MP = 0.0
+            prev_P_MP = P_mp.copy()
+
+            # 1. SMA
+            window_P_MP.append(P_mp.copy())
+            if len(window_P_MP) > 0:
+                baseline_MP = np.mean(window_P_MP, axis=0)
+            else:
+                baseline_MP = P_mp.copy()
+            V_MP = P_mp - baseline_MP   # 2D 震動向量
+
+            # 2. Project → 1D
+            if axis_MP is not None:
+                axis_MP_used = axis_MP
+            elif axis_MP_last is not None:
+                axis_MP_used = axis_MP_last.copy()
+            else:
+                axis_MP_used = None
+
+            v1d_MP = 0.0
+            if axis_MP_used is not None:
+                v1d_MP = float(np.dot(V_MP, axis_MP_used))
+
+            # 3. WindowMax on |v1d|
+            M_inst_MP = abs(v1d_MP)
+            window_M_MP.append(M_inst_MP)
+            envelope_MP = max(window_M_MP) if len(window_M_MP) > 0 else 0.0
+
+            # 4. Dynamic Gain
+            if envelope_MP < eps:
+                gain_MP = 0.0
+                v1d_MP_scaled = 0.0
+            else:
+                gain_MP = target_radius / envelope_MP
+                v1d_MP_scaled = v1d_MP * gain_MP
+
+            if axis_MP_used is not None:
+                offset_MP_proj = axis_MP_used * v1d_MP_scaled  # 投影後 2D
+            else:
+                offset_MP_proj = np.zeros(2, dtype=np.float32)
+
+            offset_MP_raw = V_MP * gain_MP
+
+            # 限制 raw 在圓內
+            norm_raw = float(np.linalg.norm(offset_MP_raw))
+            if norm_raw > target_radius and norm_raw > eps:
+                offset_MP_raw *= target_radius / norm_raw
+
+        # ---------- Optical Flow 路徑 ----------
+        if P_virtual is not None:
+            P_of = P_virtual
+
+            if prev_P_OF is not None:
+                dist = float(np.linalg.norm(P_of - prev_P_OF))
+                if dist > cut_thresh:
+                    window_P_OF.clear()
+                    window_M_OF.clear()
+                    envelope_OF = 0.0
+            prev_P_OF = P_of.copy()
+
+            # 1. SMA
+            window_P_OF.append(P_of.copy())
+            if len(window_P_OF) > 0:
+                baseline_OF = np.mean(window_P_OF, axis=0)
+            else:
+                baseline_OF = P_of.copy()
+            V_OF = P_of - baseline_OF   # 2D 震動向量
+
+            # 2. Project：軸向取當下 or last_dir
+            axis_OF = None
+            norm_V_of = float(np.linalg.norm(V_OF))
+            if norm_V_of > eps:
+                axis_OF = V_OF / norm_V_of   # 即時震動方向
+                axis_OF_last = axis_OF.copy()
+            elif axis_OF_last is not None:
+                axis_OF = axis_OF_last.copy()
+
+            axis_OF_used = axis_OF
+
+            v1d_OF = 0.0
+            if axis_OF_used is not None:
+                v1d_OF = float(np.dot(V_OF, axis_OF_used))  # = norm(V_OF) 如果 axis=V/||V||
+
+            # 3. WindowMax
+            M_inst_OF = abs(v1d_OF)
+            window_M_OF.append(M_inst_OF)
+            envelope_OF = max(window_M_OF) if len(window_M_OF) > 0 else 0.0
+
+            # 4. Dynamic Gain
+            if envelope_OF < eps:
+                gain_OF = 0.0
+                v1d_OF_scaled = 0.0
+            else:
+                gain_OF = target_radius / envelope_OF
+                v1d_OF_scaled = v1d_OF * gain_OF
+
+            if axis_OF_used is not None:
+                offset_OF_proj = axis_OF_used * v1d_OF_scaled
+            else:
+                offset_OF_proj = np.zeros(2, dtype=np.float32)
+
+            offset_OF_raw = V_OF * gain_OF
+            norm_raw_of = float(np.linalg.norm(offset_OF_raw))
+            if norm_raw_of > target_radius and norm_raw_of > eps:
+                offset_OF_raw *= target_radius / norm_raw_of
+
+        # ====== 最終輸出球：根據 Guard 選其中一路 ======
+        if use_mediapipe:
+            final_offset = offset_MP_proj
+            final_axis   = axis_MP_used
+        else:
+            final_offset = offset_OF_proj
+            final_axis   = None #axis_OF_used
+
+        center_output = center_center + final_offset
+
+        # 保險：限制 final 在大圈內
         offset_center = center_output - center_center
         mag_center = float(np.linalg.norm(offset_center))
-        if mag_center > target_radius and mag_center > 1e-4:
+        if mag_center > target_radius and mag_center > eps:
             offset_center *= target_radius / mag_center
             center_output = center_center + offset_center
 
         center_output[0] = np.clip(center_output[0], 0, w - 1)
         center_output[1] = np.clip(center_output[1], 0, h - 1)
 
-        # 箭頭基底 & 頂端（畫在中間那個圈）
-        arrow_base_center = None
-        arrow_tip_center  = None
-        if dir_u is not None:
-            arrow_base_center = center_center - dir_u * target_radius
-            arrow_tip_center  = center_center + dir_u * target_radius
-
-        # ====== 右下小圈：原始未投影 output ======
-        raw_output = compass_center + scaled_V
-        offset_raw = raw_output - compass_center
-        mag_raw = float(np.linalg.norm(offset_raw))
-        if mag_raw > target_radius and mag_raw > 1e-4:
-            offset_raw *= target_radius / mag_raw
-            raw_output = compass_center + offset_raw
-
-        raw_output[0] = np.clip(raw_output[0], 0, w - 1)
-        raw_output[1] = np.clip(raw_output[1], 0, h - 1)
-
         # ====== Debug 文字 ======
         y0, dy, line = 15, 14, 0
-        if fusion_center is not None:
-            txt = f"P_curr: ({fusion_center[0]:.1f}, {fusion_center[1]:.1f})"
-            cv2.putText(
-                gray_bgr, txt, (5, y0 + line * dy),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255),
-                1, cv2.LINE_AA,
-            )
-            line += 1
 
-        if envelope > 0:
-            txt_env = f"E(t): {envelope:.4f}"
-            cv2.putText(
-                gray_bgr, txt_env, (5, y0 + line * dy),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 255, 200),
-                1, cv2.LINE_AA,
-            )
-            line += 1
+        mode_str = "MP" if use_mediapipe else "FLOW"
+        cv2.putText(
+            gray_bgr, f"Mode: {mode_str}", (5, y0 + line * dy),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 255),
+            1, cv2.LINE_AA,
+        )
+        line += 1
 
-        if ema_dt is not None and ema_dt > 1e-4:
-            fps_text = f"Est. FPS: {SAMPLE_FPS:.2f}"
-            cv2.putText(
-                gray_bgr, fps_text, (5, y0 + line * dy),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 0),
-                1, cv2.LINE_AA,
-            )
+        fps_text = f"Est. FPS: {SAMPLE_FPS:.2f}"
+        cv2.putText(
+            gray_bgr, fps_text, (5, y0 + line * dy),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 0),
+            1, cv2.LINE_AA,
+        )
+        line += 1
 
-        # ====== 中間大圈 ======
+        txt_mp_env = f"MP env: {envelope_MP:.3f}"
+        cv2.putText(
+            gray_bgr, txt_mp_env, (5, y0 + line * dy),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 255, 200),
+            1, cv2.LINE_AA,
+        )
+        line += 1
+
+        txt_of_env = f"OF env: {envelope_OF:.3f}"
+        cv2.putText(
+            gray_bgr, txt_of_env, (5, y0 + line * dy),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 255),
+            1, cv2.LINE_AA,
+        )
+
+        # ====== 畫三組大圈 / 小圈 ======
+
+        # 1. 中間大圈（最終輸出）
         center_int = (int(center_center[0]), int(center_center[1]))
         cv2.circle(
             gray_bgr,
@@ -395,20 +613,8 @@ def processing_loop():
             cv2.LINE_AA,
         )
 
-        # 中間的朝向箭頭（骨盆→頭，長度 = 圓直徑）
-        if arrow_base_center is not None and arrow_tip_center is not None:
-            base_pt = (int(arrow_base_center[0]), int(arrow_base_center[1]))
-            tip_pt  = (int(arrow_tip_center[0]),  int(arrow_tip_center[1]))
-            cv2.arrowedLine(
-                gray_bgr,
-                base_pt,
-                tip_pt,
-                (255, 0, 255),
-                2,
-                tipLength=0.15
-            )
+        draw_axis_arrow(gray_bgr, center_center, final_axis, target_radius, (255, 0, 255))
 
-        # 中間的「投影後」黃點
         cv2.circle(
             gray_bgr,
             (int(center_output[0]), int(center_output[1])),
@@ -418,33 +624,146 @@ def processing_loop():
             cv2.LINE_AA,
         )
 
-        # ====== 右下小圈（原始 output，不投影，也沒有箭頭） ======
-        compass_int = (int(compass_center[0]), int(compass_center[1]))
+        # 2. 右上兩顆：MediaPipe
+        mp_proj_int = (int(mp_proj_center[0]), int(mp_proj_center[1]))
+        mp_raw_int  = (int(mp_raw_center[0]),  int(mp_raw_center[1]))
+
         cv2.circle(
             gray_bgr,
-            compass_int,
+            mp_proj_int,
+            int(target_radius),
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.circle(
+            gray_bgr,
+            mp_raw_int,
             int(target_radius),
             (255, 255, 255),
             1,
             cv2.LINE_AA,
         )
 
+        # MediaPipe 投影球箭頭 + 點
+        draw_axis_arrow(gray_bgr, mp_proj_center, axis_MP_used, target_radius, (0, 0, 255))
+        mp_proj_dot = mp_proj_center + offset_MP_proj
+        mp_proj_dot = np.clip(mp_proj_dot, [0, 0], [w - 1, h - 1])
         cv2.circle(
             gray_bgr,
-            (int(raw_output[0]), int(raw_output[1])),
-            6,
+            (int(mp_proj_dot[0]), int(mp_proj_dot[1])),
+            4,
             (0, 255, 255),
             -1,
             cv2.LINE_AA,
+        )
+
+        mp_raw_dot = mp_raw_center + offset_MP_raw
+        mp_raw_dot = np.clip(mp_raw_dot, [0, 0], [w - 1, h - 1])
+        cv2.circle(
+            gray_bgr,
+            (int(mp_raw_dot[0]), int(mp_raw_dot[1])),
+            4,
+            (0, 255, 255),
+            -1,
+            cv2.LINE_AA,
+        )
+
+        # 3. 右下兩顆：Optical Flow
+        of_proj_int = (int(of_proj_center[0]), int(of_proj_center[1]))
+        of_raw_int  = (int(of_raw_center[0]),  int(of_raw_center[1]))
+
+        cv2.circle(
+            gray_bgr,
+            of_proj_int,
+            int(target_radius),
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.circle(
+            gray_bgr,
+            of_raw_int,
+            int(target_radius),
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+        draw_axis_arrow(gray_bgr, of_proj_center, axis_OF_used, target_radius, (0, 0, 255))
+        of_proj_dot = of_proj_center + offset_OF_proj
+        of_proj_dot = np.clip(of_proj_dot, [0, 0], [w - 1, h - 1])
+        cv2.circle(
+            gray_bgr,
+            (int(of_proj_dot[0]), int(of_proj_dot[1])),
+            4,
+            (0, 255, 255),
+            -1,
+            cv2.LINE_AA,
+        )
+
+        of_raw_dot = of_raw_center + offset_OF_raw
+        of_raw_dot = np.clip(of_raw_dot, [0, 0], [w - 1, h - 1])
+        cv2.circle(
+            gray_bgr,
+            (int(of_raw_dot[0]), int(of_raw_dot[1])),
+            4,
+            (0, 255, 255),
+            -1,
+            cv2.LINE_AA,
+        )
+
+        # 4. 高亮框：用藍色框出目前採用的那一排兩顆球
+        highlight_color  = (255, 0, 0)  # BGR → 藍色
+        highlight_thick  = 2
+        highlight_margin = 6            # 框框比圓稍微大一點
+
+        if use_mediapipe:
+            # 框住上排：mp_proj_center + mp_raw_center
+            row_y   = mp_row_y
+            left_x  = mp_proj_center[0]
+            right_x = mp_raw_center[0]
+        else:
+            # 框住下排：of_proj_center + of_raw_center
+            row_y   = of_row_y
+            left_x  = of_proj_center[0]
+            right_x = of_raw_center[0]
+
+        x_min = min(left_x, right_x) - target_radius - highlight_margin
+        x_max = max(left_x, right_x) + target_radius + highlight_margin
+        y_min = row_y - target_radius - highlight_margin
+        y_max = row_y + target_radius + highlight_margin
+
+        # 保險：clip 在畫面內
+        x_min = int(max(0, x_min))
+        x_max = int(min(w - 1, x_max))
+        y_min = int(max(0, y_min))
+        y_max = int(min(h - 1, y_max))
+
+        cv2.rectangle(
+            gray_bgr,
+            (x_min, y_min),
+            (x_max, y_max),
+            highlight_color,
+            highlight_thick,
+            cv2.LINE_AA,
+        )
+
+
+        # ====== 更新光流狀態，準備下一幀 ======
+        prev_gray = gray.copy()
+        prev_pts = cv2.goodFeaturesToTrack(
+            prev_gray,
+            maxCorners=FLOW_MAX_CORNERS,
+            qualityLevel=FLOW_QUALITY,
+            minDistance=FLOW_MIN_DIST,
+            blockSize=7,
         )
 
         with lock:
             processed_frame = gray_bgr.copy()
 
     pose.close()
-
-
-
 
 
 # 啟動 worker threads
@@ -465,7 +784,7 @@ try:
                 frame_to_show = latest_frame.copy()
 
         if frame_to_show is not None:
-            cv2.imshow(f"Pose @ {int(TARGET_FPS)} FPS (gray + global freq)", frame_to_show)
+            cv2.imshow(f"Pose @ {int(TARGET_FPS)} FPS (gray + dual mode)", frame_to_show)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
