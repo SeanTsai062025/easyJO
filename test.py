@@ -16,7 +16,7 @@ latest_frame_id = -1       # 目前最新畫面是第幾幀
 lock = threading.Lock()
 running = True
 
-VIDEO_PATH = "test_video1.MP4"
+VIDEO_PATH = "test_front5"
 TARGET_FPS = 10.0          # 播放 & 取樣幀率
 SAMPLE_FPS = TARGET_FPS    # 真正給頻率分析用的採樣率（由 processing loop 動態估）
 
