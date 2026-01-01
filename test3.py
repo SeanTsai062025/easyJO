@@ -10,7 +10,7 @@ mp_pose = mp.solutions.pose
 # =========================
 # tunable parameters
 # =========================
-VIDEO_PATH = "test_video/test_video1.MP4"
+VIDEO_PATH = "test_video/wholevideo.MP4"
 TARGET_FPS = 10.0
 
 SMA_WINDOW = 3          # baseline smoothing window (V=P-B)
@@ -37,6 +37,15 @@ TARGET_RADIUS = 30.0
 
 VISIBLE_POINTS = list(range(1, 13)) + [23, 24]   # 14 points
 # =========================
+
+# ---- Debug: 顯示 Optical Flow 追蹤點 ----
+DRAW_OF_FULL_TRACKS = True     # 顯示全畫面 OF 追蹤點
+DRAW_CORNER_TRACKS  = True     # 顯示 CornerCam 追蹤點
+DRAW_TRACK_LINES    = True     # 是否畫 old->new 線
+TRACK_DOT_R         = 2        # 點半徑
+TRACK_LINE_THICK    = 1
+TRACK_MAX_DRAW      = 80       # 最多畫幾個（避免畫面太亂）
+
 
 
 # =========================
@@ -80,6 +89,28 @@ def draw_axis_arrow(img, center, axis, radius, color, thickness=2):
         cv2.LINE_AA,
         tipLength=0.2,
     )
+
+def draw_lk_tracks(img, good_old, good_new,
+                   color_pt=(0,255,0), color_ln=(0,128,255),
+                   r=2, thick=1, max_draw=80, draw_lines=True):
+    if good_old is None or good_new is None:
+        return
+
+    p0 = np.asarray(good_old).reshape(-1, 2)
+    p1 = np.asarray(good_new).reshape(-1, 2)
+    n = min(len(p0), len(p1), int(max_draw))
+
+    for i in range(n):
+        x0, y0 = int(p0[i,0]), int(p0[i,1])
+        x1, y1 = int(p1[i,0]), int(p1[i,1])
+
+        if draw_lines:
+            cv2.line(img, (x0, y0), (x1, y1),
+                     color_ln, thick, cv2.LINE_AA)
+
+        cv2.circle(img, (x1, y1),
+                   r, color_pt, -1, cv2.LINE_AA)
+
 
 def draw_link_arrow(img, p0, p1, radius, color=(255, 0, 0), thickness=2):
     """
@@ -396,6 +427,21 @@ def processing_loop():
                 if next_pts is not None and status is not None:
                     good_new = next_pts[status.reshape(-1) == 1]
                     good_old = prev_pts_cam[status.reshape(-1) == 1]
+
+                    if DRAW_CORNER_TRACKS:
+                        draw_lk_tracks(
+                            gray_bgr,
+                            good_old,
+                            good_new,
+                            color_pt=(0, 255, 255),   # 黃色點
+                            color_ln=(255, 255, 0),   # 青色線
+                            r=TRACK_DOT_R,
+                            thick=TRACK_LINE_THICK,
+                            max_draw=TRACK_MAX_DRAW,
+                            draw_lines=DRAW_TRACK_LINES
+                        )
+
+
                     corner_n = len(good_new)
                     if corner_n >= CORNER_MIN_POINTS:
                         diffs = (good_new - good_old).reshape(-1, 2).astype(np.float32)
@@ -432,6 +478,23 @@ def processing_loop():
                 if next_pts is not None and status is not None:
                     good_new = next_pts[status.reshape(-1) == 1]
                     good_old = prev_pts_full[status.reshape(-1) == 1]
+
+                    # ---- 顯示 全畫面 Optical Flow 追蹤點 ----
+                    if DRAW_OF_FULL_TRACKS:
+                        draw_lk_tracks(
+                            gray_bgr,
+                            good_old,
+                            good_new,
+                            color_pt=(255, 100, 0),
+                            color_ln=(255, 180, 80),
+                            r=TRACK_DOT_R,
+                            thick=TRACK_LINE_THICK,
+                            max_draw=TRACK_MAX_DRAW,
+                            draw_lines=DRAW_TRACK_LINES
+                        )
+
+
+                    
                     if len(good_new) > 0:
                         diffs_full = (good_new - good_old).reshape(-1, 2).astype(np.float32)
                         v_flow_full = np.median(diffs_full, axis=0).astype(np.float32)
@@ -716,9 +779,85 @@ def processing_loop():
             v1d = float(np.dot(V, axis))
             return axis * (v1d * gain)
 
-        # offsets for each project axis ball (based on V_OF)
-        offset_proj_mpaxis = proj_offset_with_fallback(V_OF, axis_from_mp,  gain, offset_OF_raw)
-        offset_proj_poa    = proj_offset_with_fallback(V_OF, axis_VOF_last, gain, offset_OF_raw)
+        # =========================
+        # NEW UI LOGIC: Source -> Project Panel -> Final copies Project
+        # =========================
+
+        # 1) choose CURRENT SOURCE for UI projection
+        #    MP mode -> MP raw (V_MP + gain_mp)
+        #    OF mode -> OF raw (V_OF + gain)
+        #    fallback: if MP not available, use OF
+        if use_mediapipe and (fusion_center_mp_ui is not None) and (axis_MP_used is not None):
+            V_src        = V_MP.copy()
+            gain_src     = float(gain_mp)
+            raw_fallback = offset_MP_raw.copy()
+        else:
+            V_src        = V_OF.copy()
+            gain_src     = float(gain)
+            raw_fallback = offset_OF_raw.copy()
+
+        def proj_offset_with_fallback_src(V, axis, gain, raw_offset):
+            if axis is None:
+                return raw_offset.copy()
+            v1d = float(np.dot(V, axis))
+            return axis * (v1d * gain)
+
+        # 2) Project Panel dots: BOTH balls project the SAME source
+        offset_proj_mpaxis = proj_offset_with_fallback_src(V_src, axis_from_mp,  gain_src, raw_fallback)
+        offset_proj_poa    = proj_offset_with_fallback_src(V_src, axis_VOF_last, gain_src, raw_fallback)
+
+        mpaxis_dot = np.clip(proj_mpaxis_center + offset_proj_mpaxis, [0, 0], [w - 1, h - 1])
+        poa_dot    = np.clip(proj_poa_center    + offset_proj_poa,    [0, 0], [w - 1, h - 1])
+
+        cv2.circle(gray_bgr, (int(mpaxis_dot[0]), int(mpaxis_dot[1])),
+                4, (0, 255, 255), -1, cv2.LINE_AA)
+        cv2.circle(gray_bgr, (int(poa_dot[0]), int(poa_dot[1])),
+                4, (0, 255, 255), -1, cv2.LINE_AA)
+
+        # 3) Selection wiring (same decision as before, but Final copies selected Project dot)
+        if use_mediapipe:
+            sel_model = mp_center_model
+            sel_proj  = proj_mpaxis_center
+            sel_axis  = axis_from_mp
+            sel_project_dot = mpaxis_dot.copy()
+        else:
+            sel_model = of_center_model
+            using_mp_axis_for_of = (checkA_mp_trustworthy and (axis_from_mp is not None))
+            if using_mp_axis_for_of:
+                sel_proj = proj_mpaxis_center
+                sel_axis = axis_from_mp
+                sel_project_dot = mpaxis_dot.copy()
+            else:
+                sel_proj = proj_poa_center
+                sel_axis = axis_VOF_last
+                sel_project_dot = poa_dot.copy()
+
+        # ---- final big circle ----
+        cv2.circle(gray_bgr, (int(final_center[0]), int(final_center[1])),
+                int(target_radius), (255, 255, 255), 1, cv2.LINE_AA)
+
+        # final axis arrow (purple)
+        draw_axis_arrow(gray_bgr, final_center, sel_axis, target_radius, (255, 0, 255))
+
+        # 4) Final dot = EXACT copy of selected Project dot (copy its offset)
+        sel_offset = (sel_project_dot - sel_proj).astype(np.float32)
+        final_dot  = np.clip(final_center + sel_offset, [0, 0], [w - 1, h - 1])
+
+        cv2.circle(gray_bgr, (int(final_dot[0]), int(final_dot[1])),
+                5, (0, 255, 255), -1, cv2.LINE_AA)
+
+        # ---- dynamic blue arrows (selection wiring) ----
+        draw_link_arrow(gray_bgr, sel_model, sel_proj, target_radius, color=(255, 0, 0), thickness=2)
+        draw_link_arrow(gray_bgr, sel_proj,  final_center, target_radius, color=(255, 0, 0), thickness=2)
+
+        # ---- highlight selected model circle + selected project circle ----
+        def highlight_circle(center):
+            cv2.circle(gray_bgr, (int(center[0]), int(center[1])),
+                    int(target_radius) + 6, (255, 0, 0), 2, cv2.LINE_AA)
+
+        highlight_circle(sel_model)
+        highlight_circle(sel_proj)
+
 
         # ---- project dots (yellow) ----
         mpaxis_dot = np.clip(proj_mpaxis_center + offset_proj_mpaxis, [0, 0], [w - 1, h - 1])
